@@ -1,0 +1,83 @@
+# libFuzzer dictionary for XML / libexpat
+# Format: one token per line, quoted. Hex escapes via \xNN.
+
+# Declarations and processing instructions
+"<?xml"
+"?>"
+"<?xml-stylesheet"
+"version=\"1.0\""
+"version=\"1.1\""
+"encoding=\"UTF-8\""
+"encoding=\"UTF-16\""
+"encoding=\"ISO-8859-1\""
+"encoding=\"US-ASCII\""
+"standalone=\"yes\""
+"standalone=\"no\""
+
+# Comments
+"<!--"
+"-->"
+
+# CDATA
+"<![CDATA["
+"]]>"
+
+# DOCTYPE and DTD
+"<!DOCTYPE"
+"<!ELEMENT"
+"<!ATTLIST"
+"<!ENTITY"
+"<!NOTATION"
+"PUBLIC"
+"SYSTEM"
+"NDATA"
+"#PCDATA"
+"#IMPLIED"
+"#REQUIRED"
+"#FIXED"
+"EMPTY"
+"ANY"
+"CDATA"
+"ID"
+"IDREF"
+"IDREFS"
+"ENTITY"
+"ENTITIES"
+"NMTOKEN"
+"NMTOKENS"
+
+# Entity references
+"&amp;"
+"&lt;"
+"&gt;"
+"&quot;"
+"&apos;"
+"&#"
+"&#x"
+";"
+
+# Tags
+"</"
+"/>"
+"<root>"
+"</root>"
+"<a>"
+"</a>"
+
+# Attributes
+"xmlns"
+"xmlns:"
+"xml:lang"
+"xml:space"
+"xml:base"
+"=\"\""
+
+# Conditional sections
+"<!["
+"INCLUDE"
+"IGNORE"
+
+# BOM
+"\xef\xbb\xbf"
+"\xff\xfe"
+"\xfe\xff"
