@@ -4,3 +4,6 @@
 [submodule "targets/libconfig"]
 	path = targets/libconfig
 	url = https://github.com/hyperrealm/libconfig.git
+[submodule "targets/libucl"]
+	path = targets/libucl
+	url = https://github.com/vstakhov/libucl.git
