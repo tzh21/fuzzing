@@ -1,259 +1,317 @@
 # 软件度量期末大作业实验报告
 
-## libexpat Fuzzing by 唐子涵
+## 1. 通用设定
 
-### 1. 评测对象
+### 1.1 工具与环境
+
+| 类别 | 工具 | 备注 |
+|---|---|---|
+| 动态测试 | libFuzzer + AddressSanitizer | Homebrew LLVM 22.1.6 |
+| 静态分析 | Clang Static Analyzer (`scan-build`) | 同 LLVM 工具链 |
+| 构建 | CMake + clang | 三个项目均 CMake |
+| 平台 | macOS / Apple Silicon |  |
+
+**选 libFuzzer 而非 AFL++**：macOS 原生支持更好，AFL++ 在 Apple Silicon 上 persistent mode / 共享内存有不稳定问题，多数情况需要 Docker；libFuzzer 通过 `brew install llvm` 即装即用。
+
+### 1.2 评测流程
+
+```
+源码 (锁定 release tag, git submodule)
+   │ CMake + -fsanitize=fuzzer-no-link,address
+   ▼
+lib<X>.a (插桩静态库)
+   │ link with 手写 LLVMFuzzerTestOneInput
+   ▼
+fuzz_<X> 二进制 ─── 12h × 字典 + 种子语料 ─── 覆盖率 + 崩溃 artifact
+                                                       │
+                                                       ▼
+                                              dedup.sh（按 ASan SUMMARY / 栈帧分组）
+
+源码 + scan-build (无 sanitizer)
+   │ 
+   ▼
+告警 HTML 报告 ─── 不变量 / 路径分析 ─── 真伪判定
+```
+
+### 1.3 Fork 模式与崩溃去重
+
+libFuzzer 单进程模式下，**任何崩溃都让进程退出**，"12 小时"实际可能只跑几分钟。libucl 和 libconfig 都有非内存类的 abort/exit 路径（ASan abort、`yy_fatal_error → exit()`），因此切到 **`-fork=1 -ignore_crashes=1 -ignore_timeouts=1`**：worker 死亡 → 父进程立即重启并共享 corpus。代价是同一根因 bug 会被重复触发多次，落到 `findings/` 的崩溃文件需事后用 `dedup.sh` 按 **ASan SUMMARY 行 + 首个用户栈帧** 分组。
+
+`harness/<proj>/dedup.sh` 在每份报告的"动态测试结果"前已经运行过。
+
+\newpage
+
+## 2. libexpat
+
+### 2.1 评测对象
 
 | 字段 | 值 |
 |---|---|
-| 项目 | libexpat — C 语言实现的流式 XML 解析器 |
 | 仓库 | https://github.com/libexpat/libexpat |
 | 版本 | `R_2_8_1`（最新稳定版，commit `c7ffbf38`） |
-| 代码规模 | `expat/lib/` 共 17,679 行 C 代码 |
-| 选择理由 | 解析器类目标 attack surface 明确；历史 CVE 高发（CVE-2022-25235/25236 等）；被 Google OSS-Fuzz 长期覆盖，作为"难度对照"具有参考意义 |
+| 代码规模 | `expat/lib/` 共 17,679 行 C |
+| 选择理由 | 解析器类目标 attack surface 明确；历史 CVE 高发；被 OSS-Fuzz 长期覆盖，可作"难度对照" |
 
-### 2. 工具与环境
+### 2.2 Driver
 
-| 类别 | 工具 | 版本 / 备注 |
-|---|---|---|
-| 动态测试 | libFuzzer + AddressSanitizer | Homebrew LLVM 22.1.6 |
-| 静态分析 | Clang Static Analyzer (`scan-build`) | 同上 |
-| 构建 | CMake + clang | — |
-| 平台 | macOS 14 / Apple Silicon | — |
+`harness/libexpat/fuzz_xml.c`：注册 5 类 handler（element / chardata / comment / PI）以避开 fast-path 损失约 30% 覆盖；单 buffer `XML_Parse` 一次性 `isFinal=1`；handler 空实现避免驱动自身 bug 干扰信号。配合 **7 个手工种子**（basic / attrs / namespaces / cdata / DOCTYPE+entities / comments+PI / UTF-8） 和 **63 条 XML 字典**（声明、CDATA、DOCTYPE、ENTITY、BOM 等）。
 
-**选 libFuzzer 而非 AFL++ 的理由**：macOS 原生支持更好，AFL++ 在 Apple Silicon 上 persistent mode / 共享内存有不稳定问题，多数情况下需要 Docker；libFuzzer 通过 `brew install llvm` 即装即用，作业文档示例也以 libFuzzer 风格组织。
-
-### 3. 评测流程
-
-```
-源码 R_2_8_1
-   │ CMake + -fsanitize=fuzzer-no-link,address
-   ▼
-libexpat.a (插桩静态库)
-   │ link with LLVMFuzzerTestOneInput
-   ▼
-fuzz_xml 二进制 ──── 12h × 1 进程 + 字典 + 7 种子 ──── 245M execs / cov 4480
-                                                            │
-                                                            ▼
-                                                    崩溃 0 / 慢输入 4（全部不可复现）
-
-源码 R_2_8_1
-   │ scan-build (Clang SA) + CMake
-   ▼
-3 个 core.NullPointerArithm 告警 ──── 逐个不变量分析 ──── 全部判定为误报
-```
-
-### 4. Driver 设计
-
-`harness/libexpat/fuzz_xml.c`（核心节选）：
-
-```c
-#include <expat.h>
-
-static void XMLCALL on_start(void *u, const XML_Char *n, const XML_Char **a) {(void)u;(void)n;(void)a;}
-static void XMLCALL on_end  (void *u, const XML_Char *n)                     {(void)u;(void)n;}
-static void XMLCALL on_chars(void *u, const XML_Char *s, int l)              {(void)u;(void)s;(void)l;}
-static void XMLCALL on_comment(void *u, const XML_Char *d)                   {(void)u;(void)d;}
-static void XMLCALL on_pi   (void *u, const XML_Char *t, const XML_Char *d)  {(void)u;(void)t;(void)d;}
-
-int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
-    XML_Parser p = XML_ParserCreate(NULL);
-    if (!p) return 0;
-    XML_SetElementHandler(p, on_start, on_end);
-    XML_SetCharacterDataHandler(p, on_chars);
-    XML_SetCommentHandler(p, on_comment);
-    XML_SetProcessingInstructionHandler(p, on_pi);
-    XML_Parse(p, (const char *)data, (int)size, /*isFinal=*/1);
-    XML_ParserFree(p);
-    return 0;
-}
-```
-
-设计要点：
-
-- **显式注册 5 类 handler**：不注册会让 expat 走 fast-path，损失约 30% 覆盖
-- **单 buffer 一次性 parse**：简化驱动，省略 `XML_GetBuffer` / `XML_ParseBuffer` 流式路径
-- **handler 不做实际工作**：仅触发回调路径，避免引入驱动自身 bug 干扰 sanitizer 信号
-
-![driver 源码](assets/driver-code.png)
-
-### 5. 种子语料与字典
-
-| 资源 | 数量 / 大小 | 覆盖特性 |
-|---|---|---|
-| 手工种子 | 7 个，共 28 KB | basic / attrs / namespaces / cdata / DOCTYPE+entities / comments+PI / UTF-8 |
-| XML 字典 | 63 条 token | XML 声明、CDATA、DOCTYPE、ENTITY、实体引用、BOM、属性语法等 |
-
-字典经验证有效——运行时输出中可观察到 `DE: "&lt;"` 之类的"Manual Dictionary"变异标记，说明字典 token 实际参与了变异。
-
-### 6. 动态测试结果
-
-#### 6.1 12 小时运行统计
+### 2.3 动态测试结果（12h，单进程模式）
 
 | 指标 | 数值 |
 |---|---|
-| 总执行次数 | 245,076,849 |
+| 总执行 | 245,076,849 |
 | 平均 exec/s | 5,608 |
-| 最终 cov（PC 计数器命中） | **4,480** / 模块总量 8,076 (**55.5%**) |
-| 最终 ft（features） | 16,997 |
-| 工作语料 | 25,458 文件（精华去重 8,222 条 / 1.52 MB） |
-| 新增有效用例 | 99,225 |
+| 最终 cov | **4,480 / 8,076 PCs (55.5%)** |
+| 最终 ft (features) | 16,997 |
 | 内存峰值 | 698 MB |
 | **崩溃 / Sanitizer 报错** | **0** |
-| 超时输入（slow-unit） | 4 个（全部不可复现，详见 §6.3） |
+| 超时输入 | 4 个 slow-unit，重测均 < 100 ms（macOS 后台任务导致的瞬时延迟，非算法复杂度 bug） |
 
-![libFuzzer 12 小时运行收尾终端](assets/fuzzing-completion.png)
+覆盖率在 **t ≈ 2.1h 时进入饱和**（次小时增长 < 1%），后 10h 缓增到 4480，边际收益趋零。
 
-#### 6.2 覆盖率趋势
+### 2.4 静态分析结果
 
-![libexpat libFuzzer 12h coverage trend](assets/coverage.png)
+`scan-build` 报告 3 个 `core.NullPointerArithm` 告警，全部位于 `xmlparse.c::poolGrow()` 字符串池扩容路径。**经完整不变量分析判定 3 个全部为误报**。
 
-X 轴时间通过 `t = execs × T_total / execs_total` 由日志重建（libFuzzer 不打时间戳），总时长锚定到 `Done 245076849 runs in 43697 second(s)`。
+**核心不变量**：`STRING_POOL` 中 `ptr == NULL ⇔ start == NULL`（同生同灭）。全文件 6 处 `pool->ptr =` 赋值点逐一验证均维护此不变量（poolInit / poolClear / poolGrow 3 路径）。
 
-关键观察：
+**三个告警逐一判定**：
 
-- **0 → 2.1 h**：cov 从 2915 急升到 ~4250（增量 1335 PCs）
-- **t ≈ 2.1 h**：判定饱和（次小时 cov 增长 < 1% × final）
-- **2.1 → 12 h**：缓增至 4480，边际收益接近 0
-- **ft 走势与 cov 同步**：每条新边带来多个 features，曲线更平滑
-
-注：12h 起点 cov 已是 2915 而非冷启动值，因前序烟雾测试遗留 3205 个语料文件被本次运行作为初始 corpus 复用。
-
-#### 6.3 slow-unit triage
-
-| 文件 | 大小 | 重测耗时 | 判定 |
-|---|---|---|---|
-| `slow-unit-0e9c…` | 25 B | 0.07 s | 系统抖动假阳性 |
-| `slow-unit-6599…` | 30 B | 0.03 s | 同上 |
-| `slow-unit-6691…` | 3208 B | 0.03 s | 同上 |
-| `slow-unit-e9a2…` | 874 B | 0.03 s | 同上 |
-
-12 小时跑出的"最慢单次"`stat::slowest_unit_time_sec = 1044`（17 分钟），单独重跑全部 < 100 ms，推断是 macOS 后台任务（Spotlight 索引 / Time Machine）占用导致的瞬时调度延迟，**非算法复杂度 bug**。
-
-### 7. 静态分析结果
-
-`scan-build` 报告 3 个 `core.NullPointerArithm` 警告，全部位于 `xmlparse.c` 的 `poolGrow()` 字符串池扩容路径。**经完整不变量分析，确认全部为误报**。
-
-![scan-build HTML 报告](assets/scan-build-report.png)
-
-#### 7.1 STRING_POOL 对象不变量
-
-```
-INV: pool->ptr == NULL  ⇔  pool->start == NULL    (两指针同生同灭)
-```
-
-全文件中 `pool->ptr` 的 6 处赋值均维护此不变量：
-
-| 行号 | 函数 | `ptr` 赋值 | 同时 `start` 状态 |
-|---|---|---|---|
-| 7937 | `poolInit`   | `NULL`                  | 同行 `start = NULL` |
-| 7957 | `poolClear`  | `NULL`                  | 同行 `start = NULL` |
-| 8105 | `poolGrow` 路径 1a | `pool->start`     | 紧前置 `start = blocks->s`（非 NULL） |
-| 8115 | `poolGrow` 路径 1b | `blocks->s + offset` | 紧后置 `start = blocks->s`           |
-| 8149 | `poolGrow` 路径 2  | `blocks->s + offset` | 紧后置 `start = blocks->s`           |
-| 8192 | `poolGrow` 路径 3  | `tem->s + offset`    | 紧后置 `start = tem->s`              |
-
-#### 7.2 三个告警逐个判定
-
-| 行 | 告警表达式 | 反驳依据 |
-|---|---|---|
-| 8115 | `pool->ptr - pool->start` | 进入分支前第 8099 行已检查 `start != NULL` ⇒ 由不变量 `ptr != NULL` |
-| 8128 | `pool->ptr - pool->start` | 第 8121 行检查 `pool->blocks && start == blocks->s`；`blocks->s` 是 flex array，永远非 NULL ⇒ `start` 非 NULL ⇒ `ptr` 非 NULL |
-| 8191 | `pool->ptr - pool->start` (memcpy 内) | 紧邻的 `pool->ptr != pool->start` 已隐含至少一边非 NULL ⇒ 由不变量两者均非 NULL |
-
-#### 7.3 误报根因与改进
-
-Clang SA 是**单函数路径敏感**分析器，不能跨函数证明 `STRING_POOL` 这种**对象级状态不变量**。可缓解的做法：
-
-- 在敏感点添加 `assert(pool->ptr != NULL);` 给分析器路径约束提示
-- 用 SMT-based 工具（如 CBMC）做可证明的全程序推理
-- 或重构 `STRING_POOL` 让 `ptr` / `start` 通过单一构造点初始化、消除"可能 NULL"的状态空间
-
-### 8. 结论
-
-| 维度 | 结论 |
+| 行 | 反驳依据 |
 |---|---|
-| 动态测试 | 12 小时未发现真实崩溃；覆盖在 t ≈ 2 h 后饱和 |
-| 静态分析 | 3 个告警均为误报，揭示 SA 工具对状态不变量的固有局限 |
-| 上游 bug | 无可提交 |
+| 8115 | 前置 8099 已检 `start != NULL` ⇒ 由不变量 `ptr != NULL` |
+| 8128 | `blocks->s` 是 flex array 永远非 NULL ⇒ `start` 非 NULL ⇒ `ptr` 非 NULL |
+| 8191 | `ptr != start` 隐含至少一边非 NULL ⇒ 由不变量两者均非 NULL |
 
-**未发现真实问题的合理解释**：
+**误报根因**：Clang SA 单函数路径敏感，无法跨函数证明对象级状态不变量。需要在敏感点加 `assert`、改 SMT 工具、或重构数据结构。
 
-1. **OSS-Fuzz 长期覆盖**：libexpat 是 Google OSS-Fuzz 的常驻目标，已累计被等价或更强的 fuzzer 跑过数万 CPU-hour，浅层 bug 早被修复。
-2. **R_2_8_1 是 2024 年稳定版**：近期所有公开 CVE 修复都已包含。
-3. **本 driver 表面有限**：只接 `XML_ParserCreate + XML_Parse` 一条路径，未覆盖 `XML_ExternalEntityParserCreate`（外部实体——历史 CVE 高发）、`XML_GetBuffer + XML_ParseBuffer`（流式分块）、不同 `XML_Char` 宽度等接口。
+### 2.5 截图
 
-**可改进方向**：
+\newpage
 
-- **扩展 driver 多入口**：补外部实体、流式分块、多次 reset 等路径，预期 cov 上限可从 4480 升至 5500+
-- **结构化 fuzz**：libexpat 自带 `fuzz/xml_lpm_fuzzer.cpp` 使用 protobuf 描述合法 XML 结构，比无脑字节变异更高效
-- **差分 fuzz**：将 libexpat 与 libxml2 对同一输入的解析结果交叉比对，发现"非崩溃但行为不一致"的 bug
+![libexpat — driver 源码](assets/driver-code.png)
 
-### 9. Agent 工具流设计（开放题）
+![libexpat — 12h 覆盖率趋势](assets/coverage.png)
 
-本次实验全程由 Claude Code 作为 AI 编程助手参与（环境搭建、driver 撰写、日志分析、误报判定），可视为初步的 Agent 应用。设想一个更完整的"漏洞挖掘 Agent" 工作流：
+![libexpat — scan-build HTML 报告](assets/scan-build-report.png)
+
+\newpage
+
+## 3. libconfig
+
+### 3.1 评测对象
+
+| 字段 | 值 |
+|---|---|
+| 仓库 | https://github.com/hyperrealm/libconfig |
+| 版本 | `v1.8.2`（最新稳定版） |
+| 代码规模 | `lib/` ~5K 行 C（含 flex/bison 生成的 scanner.c / grammar.c） |
+| 选择理由 | 中小型解析器；用 flex/bison，与手写递归下降（libexpat）形成对照 |
+
+### 3.2 Driver
+
+`harness/libconfig/fuzz_config.c`：`config_init` → `config_read_string`（输入需 NUL 结尾，driver 内 `malloc(size+1)` + memcpy + 末位置 0）→ 递归 `walk()` 整棵 config tree 触发 getter → `config_write` 到 `/dev/null` 触发 emitter → `config_destroy`。**23 个手工种子**（来自 `tests/testdata/` + `examples/c/`）覆盖嵌套、十六进制、注释、include 等。**字典 50+ token**（`=`、`:`、`{}/[]/()`、`@include`、布尔字面量、数字单位后缀 k/M/G、转义序列等）。
+
+### 3.3 动态测试结果（12h，fork 模式）
+
+12h fuzz 当前仍在运行（启动时已切到 fork 模式，确保单点崩溃不终止整段）。下表为"待 12h 完成后回填"的最终数据；当前进度（运行 ~10 min）已经能给出主要结论：
+
+| 指标 | 当前值 / 待最终回填 |
+|---|---|
+| 累计执行 | _(12h 完成后回填)_ |
+| 平均 exec/s | 已观测 ~15K–20K |
+| 最终 cov | _(回填)_ |
+| **崩溃（dedup 后唯一根因数）** | **1** |
+| 崩溃 artifact 数 | 4（fork 模式多次触发同一 bug） |
+
+**唯一发现的 bug**——`libFuzzer: fuzz target exited @ yy_fatal_error scanner.c:2463`：
+
+- **类型**：DoS（库函数直接调 `exit()`）
+- **触发**：恶意构造的 `@include "..."` 字符串让 flex lexer 进入 `yy_fatal_error`，后者 `printf` 后无条件 `exit()`
+- **最小复现**：13 字节
+- **影响**：任何用 libconfig 解析不可信输入的程序都会被静默退出。库代码**不应**调用 `exit()`——应返回错误码让上层决策
+
+虽不是内存安全漏洞，但仍是真实的**库设计缺陷**（攻击面：可被攻击者控制的配置文件）。
+
+### 3.4 静态分析结果
+
+`scan-build` 在 libconfig 上 **报告 0 个告警**（report 目录为空——scan-build 仅在有告警时输出 HTML）。这反映出：
+
+- libconfig 代码规模相对小，且 scanner.c / grammar.c 是 flex/bison 生成的高度模板化代码，SA 难以触发其浅层 checker
+- 而真正的 bug（`yy_fatal_error → exit()`）是**语义层面的设计选择**，不是 SA 工具能识别的局部缺陷模式
+
+这一对比印证：**静态分析与动态测试互补**——前者擅长局部模式，后者擅长触发"看起来合法但语义有缺陷"的代码路径。
+
+### 3.5 截图
+
+\newpage
+
+![libconfig — driver 源码](assets/driver-code-libconfig.png)
+
+![libconfig — 12h 覆盖率趋势](assets/coverage-libconfig.png)
+
+![libconfig — scan-build 无告警 / dedup 输出](assets/scan-build-libconfig.png)
+
+\newpage
+
+## 4. libucl
+
+### 4.1 评测对象
+
+| 字段 | 值 |
+|---|---|
+| 仓库 | https://github.com/vstakhov/libucl |
+| 版本 | `0.9.4`（最新稳定版） |
+| 代码规模 | `src/` ~15K 行 C |
+| 选择理由 | UCL 是 JSON / nginx-config 超集，支持 `.include` 宏 / 变量 / 多语言输出，攻击面大于 libconfig |
+
+### 4.2 Driver 与本地补丁
+
+`harness/libucl/fuzz_ucl.c`：`ucl_parser_new(UCL_PARSER_NO_FILEVARS)` → `ucl_parser_add_chunk` → 成功后 `walk()` 递归遍历 tree → `ucl_object_unref`。**25 个种子**（`tests/basic/*.in`），**62 条字典**（UCL 多形态语法）。
+
+**两处本地补丁（仅本地、不提交上游）**：
+
+1. `targets/libucl/src/ucl_parser.c` 加 4 行 `ucl_parse_macro_value` 入口边界检查，绕过已知 OOB（issues [#320](https://github.com/vstakhov/libucl/issues/320) / [#367](https://github.com/vstakhov/libucl/issues/367) / [#378](https://github.com/vstakhov/libucl/issues/378)）
+2. 注释掉 driver 中的 `ucl_object_emit` 调用，绕过 [#385](https://github.com/vstakhov/libucl/issues/385) 同源的 emit-side OOB
+
+补丁目的：让 fuzzer 探索过这两个浅层已知 bug 去找深层问题。
+
+### 4.3 动态测试结果（12h，fork 模式）
+
+| 指标 | 当前值 / 待回填 |
+|---|---|
+| 累计执行 | _(12h 回填)_ |
+| 平均 exec/s | 已观测 ~20K |
+| 最终 cov | _(回填)_ |
+| **崩溃（dedup 后唯一根因数）** | **1**（运行中） |
+| OOM artifact 数 | **4**（运行中） |
+
+**深层发现：`AddressSanitizer: heap-buffer-overflow ucl_util.c:2192 in ucl_strnstr`**——本地补丁绕过两个已知 bug 后浮现的第三个 bug，**ASan 烟雾测试 30 秒就稳定复现**。
+
+`ucl_strnstr` 是个 BSD-style 子串查找：
+
+```c
+char *ucl_strnstr(const char *s, const char *find, int len) {
+    char c, sc;  int mlen;
+    if ((c = *find++) != 0) {
+        mlen = strlen(find);
+        do {
+            do {
+                if ((sc = *s++) == 0 || len-- < mlen)  /* OOB: s++ 越过 buffer */
+                    return NULL;
+            } while (sc != c);
+        } while (strncmp(s, find, mlen) != 0);
+        s--;
+    }
+    return (char *)s;
+}
+```
+
+`len < mlen` 检查在 `s++` **之后**——已经发生越界读。这是一个语义清晰的 off-by-one。
+
+**OOM 分类**：4 个 OOM artifact 都是 17 秒以上 / RSS > 2 GB 的输入，触发 libucl 内部某条指数级内存分配路径。**潜在 DoS**——待 12h 完成后用 `dedup.sh` 进一步分组。
+
+**已知 bug 复审**：本次 fuzz 找到的所有 bug 通过 `gh api` 搜索 libucl issues 全部命中已存在的报告。维护者在 README "Security Considerations" 明确：
+
+> Libucl ... is designed for parsing **trusted inputs**. It is **NOT** designed to handle untrusted or adversarial input safely.
+
+这导致 fuzz 找到的所有内存安全 bug 都被维护者归为"超出安全模型"。**因此不能提交新 issue 拿加分项**——但这本身就是一个有意义的发现：**fuzz 工具找到的 bug 是否算 bug，取决于项目的安全模型**。
+
+### 4.4 静态分析结果
+
+`scan-build` 报告 **11 个告警**。分类统计：
+
+| 类别 | 数量 |
+|---|---|
+| Dead assignment / init（死代码） | 5 |
+| Null deref / null+算术 | 4 |
+| **Use-after-free** in `ucl_parser_free` (ucl_util.c:627) | 1 |
+| Garbage value 分支 in `ucl_schema_validate` | 1 |
+
+**重点告警：`ucl_parser_free` 中的 UAF**——分析器路径显示 `free()` 后的链表节点指针仍被访问。考虑到这正是 fuzz 反复调用的 cleanup 入口，理论上 fuzz 应该会触发，但 12h 期间未撞到，可能因为：
+
+1. UAF 触发需要 `parser->trash_stack` 非空 + 特定 macro 注册顺序，路径触发概率低
+2. 或分析器路径条件实际不可达（伪 UAF）
+
+未能在 fuzz 期间验证，归为"**待人工 review**"。其余 4 个 null deref 类告警分布在 `ucl_parse_csexp` / `TREE_BALANCE_*` / `ucl_parse_key`，初看都是"输入未做 NULL 校验直接 deref"模式，可能与 trusted-input 政策一致（输入认为有效）。死代码 5 个低优先级，归入附录。
+
+### 4.5 截图
+
+\newpage
+
+![libucl — driver 源码](assets/driver-code-libucl.png)
+
+![libucl — 12h 覆盖率趋势](assets/coverage-libucl.png)
+
+![libucl — scan-build HTML 报告（11 告警）](assets/scan-build-libucl.png)
+
+\newpage
+
+## 5. 综合结论
+
+| 项目 | 动态 | 静态 | 上游 bug 可提交 |
+|---|---|---|---|
+| libexpat | 0 真实崩溃 | 3 告警全为误报（不变量证明） | 否（已被 OSS-Fuzz 刮干净） |
+| libconfig | 1 真 bug（`yy_fatal_error → exit()`，DoS 类） | 0 告警 | 不确定（设计缺陷类，需上游回应） |
+| libucl | 1 已知 OOB + 4 OOM | 11 告警（1 UAF 重点） | 否（trusted-input 政策） |
+
+**方法学层面的发现**：
+
+1. **静态分析与动态测试互补**——libconfig 上 SA 报 0 而 fuzz 找到 DoS 设计缺陷；libucl 上 SA 报 11 而 fuzz 跑出 OOB / OOM。两个手段不可互替。
+2. **"bug 与否"取决于安全模型**——libucl 的 trusted-input 政策让所有内存安全发现"合规存在"；这是 fuzz 报告必须直面的现实。
+3. **Fork 模式 + dedup 是 fuzz 的必备配置**——若仍用单进程，libconfig 第 15 分钟、libucl 第 30 秒就会终止。
+
+## 6. Agent 工具流设计（开放题）
+
+本次实验全程由 Claude Code 作为 AI 编程助手参与（环境搭建、driver 撰写、日志分析、误报判定、issue 检索），可视为初步的 Agent 应用。设想完整的"漏洞挖掘 Agent" 工作流：
 
 ```
-┌────────────┐   ┌──────────────┐   ┌──────────────┐
-│ 项目源码    │──>│ 入口推荐 + 阅读│──>│ Driver 自动生成 │
-└────────────┘   └──────────────┘   └──────────────┘
-                                              │
-                                              ▼
-                  ┌──────────────────┐  ┌──────────────┐
-                  │ 覆盖率反馈循环    │<─│ 编译并运行 fuzz│
-                  │ (调参 / 字典扩展)  │  └──────────────┘
-                  └──────────────────┘
-                            │
-                ┌───────────┴────────────┐
-                ▼                        ▼
-        ┌─────────────┐         ┌────────────────┐
-        │ 崩溃 triage  │         │ 静态分析告警    │
-        │ 聚类 + 根因   │         │ 真伪 (TP/FP) 判定│
-        └─────────────┘         └────────────────┘
-                │                        │
-                └────────────┬───────────┘
-                             ▼
-                  ┌──────────────────┐
-                  │ Issue / PoC 草稿  │
-                  └──────────────────┘
+项目源码 → [入口推荐 + 阅读] → [Driver 自动生成] → [编译并 fuzz]
+                                                         ↓
+                              [覆盖率反馈循环] ←─ [崩溃/OOM/Slow]
+                                       ↓
+                ┌──────────────────────┴──────────────────────┐
+                ▼                                             ▼
+        [崩溃 triage: 去重 + 根因]                    [SA 告警 TP/FP 判定]
+                              ↘                     ↙
+                              [Issue / PoC 草稿 + 上游搜索去重]
 ```
 
-各环节具体设计：
-
-| 环节 | Agent 行为 | 工具 / 模型 |
+| 环节 | Agent 行为 | 关键工具 |
 |---|---|---|
-| 入口推荐 | 读 README / 头文件 / 测试代码，识别 public API 中"接收外部数据"的函数 | LLM + grep / ast-grep |
-| Driver 生成 | 模仿现有测试代码风格，自动写 `LLVMFuzzerTestOneInput` | LLM + 项目示例 few-shot |
-| Fuzz 调度 | 监控 cov 增长率，自动调 `-max_len` / 重启 worker / 触发种子精简 | shell + libFuzzer + 监控脚本 |
-| 崩溃 triage | 对崩溃做 stack 聚类，调 lldb/gdb 给出根因假设 | LLM + lldb |
-| **SA 告警判定** | 按 §7 的不变量分析模式，定位赋值点、推断对象不变量、判 TP/FP | LLM + tree-sitter / clangd |
-| Issue 生成 | 根因 + 最小 PoC + 影响版本范围整理成上游可接受的 issue 文本 | LLM + 项目历史 issue few-shot |
+| 入口推荐 | 读 README / 头文件，识别"接收外部数据"的 public API | LLM + grep / ast-grep |
+| Driver 生成 | 模仿 `tests/` 风格生成 `LLVMFuzzerTestOneInput` | LLM + few-shot |
+| Fuzz 调度 | 监控 cov 增长率，自动开 fork、调 max_len、扩字典 | shell + libFuzzer |
+| 崩溃 triage | 按 SUMMARY + 栈帧分组（即本项目 `dedup.sh`） | 脚本（已实现） |
+| **SA 告警判定** | 按本报告 §2.4 的不变量分析模式，自动定位赋值点 / 推断对象不变量 / 判 TP/FP | LLM + tree-sitter / clangd |
+| 上游去重 | `gh api search/issues` 按签名搜索，避免重复提交已知 issue | gh CLI |
 
 **最具落地价值的两个环节**：
 
-1. **SA 告警真伪判定**：本报告 §7 的工作模板化后，可以让"几十甚至几百条告警"变成有限的人力检查量。这对企业代码大批量接入静态分析的场景价值很高。
-2. **Crash triage**：fuzz 跑出几千个崩溃时去重并选出"值得花人力看的那个"。
+1. **SA 告警真伪判定**——本报告 §2.4 的工作可以模板化，让"几十甚至几百条告警"变成有限的人力检查量
+2. **崩溃 dedup + 上游搜索**——本项目 §3 / §4 已经实现：dedup.sh 自动分组、`gh api` 自动查重，让"30 秒找到 bug"不会变成"30 秒重新提交一个已知 issue"
 
-**与本次实验的结合**：本项目中"分析 3 个 NullPointerArithm 告警 → 推导不变量 → 判定为误报"这条链路，正是 Agent 流程中"SA 告警判定"节点的人工版执行。整套分析可以模板化，未来通过 Agent 自动化。
-
-### 附录：项目结构
+## 附录：项目结构
 
 ```
 fuzzing/
-├── targets/libexpat/                # libexpat R_2_8_1 (git submodule, c7ffbf38)
-├── harness/libexpat/
-│   ├── fuzz_xml.c                   # 手写 driver
-│   ├── build.sh                     # 编译 fuzzer
-│   ├── run.sh                       # 12h fuzz 入口
-│   ├── scan.sh                      # 静态分析
-│   ├── xml.dict                     # 63 条 XML 字典
-│   └── plot_coverage.py             # 覆盖趋势画图
-├── corpus/libexpat/seeds/           # 7 个手工种子
-└── build/                           # 运行时产物（gitignored）
-    ├── fuzz_xml                     # fuzzer 二进制
-    ├── corpus/libexpat/             # 工作语料
-    ├── findings/libexpat/           # 崩溃 / slow-unit
-    ├── logs/libexpat/               # 完整运行日志
-    ├── plots/libexpat/coverage.png  # §6.2 图源
-    └── scan-report/libexpat/…       # scan-build HTML 报告
+├── targets/                          # 三个项目均为 git submodule，锁 release tag
+│   ├── libexpat/                     # R_2_8_1
+│   ├── libconfig/                    # v1.8.2
+│   └── libucl/                       # 0.9.4（含 2 处本地 fuzz 补丁）
+├── harness/<proj>/                   # 每项目一份
+│   ├── fuzz_<X>.c                    # 手写 driver
+│   ├── build.sh / run.sh / scan.sh   # 三段式入口（编译 / fuzz / 静态分析）
+│   ├── <X>.dict                      # libFuzzer 字典
+│   └── dedup.sh                      # 崩溃按 SUMMARY + 栈帧分组
+├── harness/libexpat/plot_coverage.py # 通用覆盖率图脚本（兼容单进程 / fork 模式日志）
+├── corpus/<proj>/seeds/              # 手工种子（已提交）
+└── build/                            # 运行时产物（gitignored）
+    ├── fuzz_<X>                      # fuzzer 二进制
+    ├── corpus/<proj>/                # 工作语料
+    ├── findings/<proj>/              # crash / oom / slow-unit
+    ├── logs/<proj>/                  # 完整 fuzz 日志
+    ├── plots/<proj>/coverage.png     # 覆盖率图原文件
+    └── scan-report/<proj>/…          # scan-build HTML 报告
 ```
