@@ -1,0 +1,68 @@
+# libFuzzer dictionary for libconfig syntax.
+# Reference: https://hyperrealm.github.io/libconfig/libconfig_manual.html
+
+# Assignment operators
+"="
+":"
+
+# Separators
+";"
+","
+
+# Aggregates
+"{"
+"}"
+"["
+"]"
+"("
+")"
+
+# Strings
+"\"\""
+
+# Comments
+"#"
+"//"
+"/*"
+"*/"
+
+# Preprocessor
+"@include"
+"@include_optional"
+
+# Boolean literals
+"true"
+"false"
+"True"
+"False"
+"TRUE"
+"FALSE"
+"yes"
+"no"
+
+# Numeric prefixes/suffixes
+"0x"
+"0X"
+"L"
+"e+"
+"e-"
+"E+"
+"E-"
+".0"
+
+# Common keys (from libconfig examples)
+"name"
+"version"
+"value"
+"size"
+"width"
+"height"
+"flags"
+"author"
+
+# Escape sequences
+"\\n"
+"\\t"
+"\\\""
+"\\\\"
+"\\x"
